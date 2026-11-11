@@ -870,6 +870,18 @@ tr.pm-wrow td{border-bottom:1px solid var(--border);}
     return d;
   }
 
+  // Safety net: before the cloud replaces something on this device, keep the old copy here
+  // (plannerkeep_prev is never synced, so a bad copy in the cloud can't wipe it).
+  const PREV = 'plannerkeep_prev';
+  function stash(k, old){
+    if (old === null || old === undefined) return;
+    try {
+      const all = readJ(PREV, {}); const list = (all[k] || []).filter(x => x.v !== old);
+      list.unshift({ v: old, at: Date.now() }); all[k] = list.slice(0, 3);
+      try { oSet.call(ls, PREV, JSON.stringify(all)); }
+      catch(e) { all[k] = list.slice(0, 1); Object.keys(all).forEach(x => { if (x !== k) all[x] = all[x].slice(0, 1); }); oSet.call(ls, PREV, JSON.stringify(all)); }
+    } catch(e) {}
+  }
   function apply(keys){
     const changed = [];
     Object.keys(keys || {}).forEach(k => {
@@ -877,6 +889,7 @@ tr.pm-wrow td{border-bottom:1px solid var(--border);}
       const rec = keys[k];
       if (meta.dirty[k] && (meta.t[k] || 0) > rec.t) return;      // ours is newer; it will be pushed
       const old = ls.getItem(k);
+      if (old !== (rec.v ?? null)) stash(k, old);
       if (rec.v === null || rec.v === undefined) oRem.call(ls, k); else oSet.call(ls, k, rec.v);
       meta.t[k] = rec.t; delete meta.dirty[k];
       if (old !== (rec.v ?? null)) changed.push([k, old, rec.v ?? null]);
@@ -932,7 +945,7 @@ tr.pm-wrow td{border-bottom:1px solid var(--border);}
     meta = { t: {}, dirty: {}, since: 0 };
     const now = Date.now();
     if (mode === 'cloud') {
-      Object.keys(cloud.keys).forEach(k => { if (synced(k)) { const v = cloud.keys[k].v; if (v === null || v === undefined) oRem.call(ls, k); else oSet.call(ls, k, v); meta.t[k] = cloud.keys[k].t; } });
+      Object.keys(cloud.keys).forEach(k => { if (synced(k)) { const v = cloud.keys[k].v; if (ls.getItem(k) !== (v ?? null)) stash(k, ls.getItem(k)); if (v === null || v === undefined) oRem.call(ls, k); else oSet.call(ls, k, v); meta.t[k] = cloud.keys[k].t; } });
       for (let i = 0; i < ls.length; i++) { const k = ls.key(i); if (synced(k) && !(k in cloud.keys)) { meta.t[k] = now; meta.dirty[k] = 1; } }
     } else {
       for (let i = 0; i < ls.length; i++) { const k = ls.key(i); if (synced(k)) { meta.t[k] = now; meta.dirty[k] = 1; } }
@@ -950,6 +963,7 @@ tr.pm-wrow td{border-bottom:1px solid var(--border);}
     pending: () => Object.keys(meta.dirty).length,
     onStatus: fn => { listeners.add(fn); fn(status); return () => listeners.delete(fn); },
     syncNow, inspect, connect, disconnect, api,
+    previous: () => readJ(PREV, {}),
     imgPut: async (id, blob) => { if (!cfg) return; const data = await new Promise(r => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(blob); }); await api('putImg', { id, data }); },
     imgDel: async id => { if (!cfg) return; await api('delImg', { id }); },
     imgGet: async id => { if (!cfg) return null; const d = await api('getImg', { id }); if (!d.data) return null; return await (await fetch(d.data)).blob(); },
@@ -1020,6 +1034,7 @@ tr.pm-wrow td{border-bottom:1px solid var(--border);}
       <div class="bk-h">Your planner data</div>
       <button id="bkExport">⬇ Download backup</button>
       <button id="bkImport">⬆ Restore from backup</button>
+      <button id="bkPrev">↶ Earlier versions</button>
       <div class="bk-note" id="bkNote"></div>
       <input type="file" id="bkFile" accept=".json,application/json" style="display:none"/>
     </div>
@@ -4440,12 +4455,34 @@ function doGet(e) {
     note.textContent = 'Backup downloaded (' + Object.keys(out.data).length + ' sections' + (nPics ? ', ' + nPics + ' picture' + (nPics === 1 ? '' : 's') : '') + ').';
   };
   document.getElementById('bkImport').onclick = () => file.click();
+  // Copies this device kept just before sync replaced them
+  const NAMES = { powerlist_v2: 'Power List', '12wy_multi_2026': '12 Week Year', planner_deadlines_v1: 'Deadlines', planner_inspo_v1: 'Inspiration', planner_gcal_v1: 'Calendar settings' };
+  document.getElementById('bkPrev').onclick = e => {
+    e.stopPropagation();
+    const prev = window.plannerSync && window.plannerSync.previous ? window.plannerSync.previous() : {};
+    const rows = [];
+    Object.keys(prev).forEach(k => (prev[k] || []).forEach((x, i) => { if (NAMES[k]) rows.push({ k, i, at: x.at, v: x.v }); }));
+    rows.sort((a, b) => b.at - a.at);
+    let ov = document.getElementById('pvOv');
+    if (!ov) { ov = document.createElement('div'); ov.id = 'pvOv'; ov.className = 'sy-ov'; document.body.appendChild(ov); ov.addEventListener('click', ev => { if (ev.target === ov) ov.classList.remove('open'); }); }
+    const desc = r => { if (r.k !== 'powerlist_v2') return Math.round(r.v.length / 100) / 10 + ' KB'; try { const pl = JSON.parse(r.v); const d = Object.keys(pl.days || {}).length; return (pl.items || []).length + ' habits: ' + (pl.items || []).slice(0, 3).map(x => x.name).join(', ') + ((pl.items || []).length > 3 ? '…' : '') + ' · ' + d + ' days'; } catch(_) { return ''; } };
+    const esc = t => String(t).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+    ov.innerHTML = `<div class="sy-card"><div class="sy-hd"><h3>Earlier versions</h3><button class="cd-btn" id="pvX">✕</button></div><div class="sy-body">
+      <p>When sync replaces something on this device, the old copy is kept here (last 3 of each).</p>
+      ${rows.length ? rows.map((r, n) => `<div class="pv-row"><div><b>${NAMES[r.k]}</b> · ${new Date(r.at).toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}<small>${esc(desc(r))}</small></div><button class="cd-btn" data-pv="${n}">Restore</button></div>`).join('') : '<p style="color:var(--text3)">Nothing saved yet.</p>'}
+    </div></div>`;
+    ov.classList.add('open'); menu.classList.remove('open');
+    ov.querySelector('#pvX').onclick = () => ov.classList.remove('open');
+    ov.querySelectorAll('[data-pv]').forEach(b => b.onclick = () => { const r = rows[+b.dataset.pv]; if (!confirm('Put back this ' + NAMES[r.k] + ' copy? It replaces the current one on all your devices.')) return; localStorage.setItem(r.k, r.v); setTimeout(() => location.reload(), 50); });
+  };
   file.onchange = () => {
     const f = file.files[0]; if (!f) return;
     const r = new FileReader();
     r.onload = () => {
       let obj;
       try { obj = JSON.parse(r.result); } catch(e) { note.textContent = "That file isn't a planner backup."; return; }
+      // also accept the sync file (data.json from the "My Planner sync" Drive folder)
+      if (obj && !obj.app && obj.keys && typeof obj.keys === 'object') { const data = {}; Object.keys(obj.keys).forEach(k => { const v = obj.keys[k] && obj.keys[k].v; if (typeof v === 'string') data[k] = v; }); obj = { app: 'my-planner', data, exported: null }; }
       if (!obj || obj.app !== 'my-planner' || !obj.data || typeof obj.data !== 'object') { note.textContent = "That file isn't a planner backup."; return; }
       const keys = Object.keys(obj.data).filter(KEEP);
       if (!keys.length) { note.textContent = 'That backup is empty.'; return; }
@@ -4994,6 +5031,8 @@ function doGet(e) {
 .sy-hd h3{font-family:var(--font-display);font-weight:400;font-size:21px;}
 .sy-body{padding:18px 20px 20px;font-size:13.5px;color:var(--text2);line-height:1.6;}
 .sy-body p{margin-bottom:10px;}
+.pv-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-top:1px solid var(--border);}
+.pv-row small{display:block;color:var(--text3);font-size:12px;margin-top:2px;}
 .sy-choice{display:grid;gap:10px;margin-top:6px;}
 .sy-opt{text-align:left;background:var(--surface2);border:1px solid var(--border2);border-radius:10px;padding:14px 16px;color:var(--text);font-family:inherit;font-size:14px;cursor:pointer;}
 .sy-opt:hover{border-color:var(--amber);}
@@ -5208,10 +5247,16 @@ function out_(o) { return ContentService.createTextOutput(JSON.stringify(o)).set
     }
     if (view === 'choose') {
       const { c, cloud } = arg;
+      const sum = get => { let pl = null; try { pl = JSON.parse(get('powerlist_v2') || 'null'); } catch(e) {}
+        if (!pl || !Array.isArray(pl.items)) return 'No Power List yet';
+        const days = Object.keys(pl.days || {}).filter(d => { const v = (pl.days[d] || {}).v; return v && Object.keys(v).length; }).length;
+        const mets = Object.keys(pl.metrics || {}).length;
+        return `Power List: ${pl.items.length} habit${pl.items.length === 1 ? '' : 's'} (${pl.items.slice(0, 2).map(i => esc(i.name)).join(', ')}${pl.items.length > 2 ? '…' : ''}), ${days} day${days === 1 ? '' : 's'} ticked, ${mets} night${mets === 1 ? '' : 's'} of sleep logged`; };
+      const cloudSum = sum(k => cloud.keys[k] ? cloud.keys[k].v : null), hereSum = sum(k => localStorage.getItem(k));
       body.innerHTML = `<p>Your Google account already has planner data (${cloud.count} section${cloud.count === 1 ? '' : 's'}), probably from your other device. Which copy should this device use?</p>
         <div class="sy-choice">
-          <button class="sy-opt" data-sy="use-cloud">Use the data from my Google account<small>Recommended on a new device or your phone. This replaces what's on this device now.</small></button>
-          <button class="sy-opt" data-sy="use-device">Keep this device's data<small>Uploads what's on this device and replaces the copy in your Google account. Only pick this if this device has your real data.</small></button>
+          <button class="sy-opt" data-sy="use-cloud">Use the data from my Google account<small>Recommended on a new device or your phone. This replaces what's on this device now.<br>${cloudSum}</small></button>
+          <button class="sy-opt" data-sy="use-device">Keep this device's data<small>Uploads what's on this device and replaces the copy in your Google account. Only pick this if this device has your real data.<br>${hereSum}</small></button>
         </div>
         <div class="sy-err" id="syErr"></div>`;
       body.querySelector('[data-sy="use-cloud"]').onclick = () => finish(c, 'cloud', cloud);
@@ -5243,7 +5288,7 @@ function out_(o) { return ContentService.createTextOutput(JSON.stringify(o)).set
   }
   async function finish(c, mode, cloud){
     body.innerHTML = '<p>Syncing… this can take a few seconds the first time.</p>';
-    try { await S.connect(c, mode, cloud); render('done'); }
+    try { await S.connect(c, mode, cloud); try { sessionStorage.setItem('sy_just_connected', '1'); } catch(e) {} location.reload(); }
     catch(e) { body.innerHTML = `<p>Something went wrong: ${esc(e.message)}</p><div class="sy-row"><button class="cd-btn" data-sy="start">Try again</button></div>`; body.querySelector('[data-sy]').onclick = () => render('start'); }
   }
 
@@ -5271,6 +5316,7 @@ function out_(o) { return ContentService.createTextOutput(JSON.stringify(o)).set
     setInterval(() => { if (S.configured && menu.classList.contains('open')) draw(S.status); }, 30000);
   }
   // a link like  …/index.html#sync=<code>  opens straight into setup
+  try { if (sessionStorage.getItem('sy_just_connected')) { sessionStorage.removeItem('sy_just_connected'); if (S.configured) open('done'); } } catch(e) {}
   const m = location.hash.match(/^#sync=(.+)$/);
   if (m && !S.configured) { open('code', decodeURIComponent(m[1])); history.replaceState(null, '', location.pathname + location.search); }
 })();
